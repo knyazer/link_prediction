@@ -139,7 +139,8 @@ def train(
             train_pos.device
         )
 
-        h = model(x, adj)
+        model_out = model(x, adj)
+        h = model_out.node_embeddings if hasattr(model_out, "node_embeddings") else model_out
 
         edge = train_pos[perm].t()
         pos_out = score_func(h[edge[0]], h[edge[1]])
@@ -201,7 +202,8 @@ def test(
     model.eval()
     score_func.eval()
 
-    h = model(x, data["adj"].to(x.device))
+    model_out = model(x, data["adj"].to(x.device))
+    h = model_out.node_embeddings if hasattr(model_out, "node_embeddings") else model_out
 
     pos_train_pred, _ = test_edge(score_func, data["train_val"], h, batch_size)
     pos_valid_pred, neg_valid_pred = test_edge(score_func, data["valid_pos"], h, batch_size, data["valid_neg"])
@@ -236,6 +238,9 @@ def main() -> None:
     parser.add_argument("--input_dir", type=str, default=str(HEART_DATASET_DIR))
     parser.add_argument("--filename", type=str, default="samples.npy")
     parser.add_argument("--eval_mrr_data_name", type=str, default="ogbl-citation2")
+    parser.add_argument("--early_exit", action="store_true", default=False)
+    parser.add_argument("--tau0", type=float, default=1.0)
+    parser.add_argument("--confidence_hidden_dim", type=int, default=64)
     args = parser.parse_args()
 
     print(args)
@@ -266,7 +271,11 @@ def main() -> None:
             num_layers=args.num_layers,
             dropout=args.dropout,
         )
-        model = WeightSharedSAS(backbone_config).to(device)
+        if args.early_exit:
+            exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
+            model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
+        else:
+            model = WeightSharedSAS(backbone_config).to(device)
 
         score_func = mlp_score(
             args.hidden_channels,
