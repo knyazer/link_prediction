@@ -1,7 +1,9 @@
 import sys
 from pathlib import Path
 
-HEART_BENCHMARKING_DIR = Path(__file__).resolve().parent.parent / "HeaRT" / "benchmarking"
+OURS_DIR = Path(__file__).resolve().parent
+HEART_BENCHMARKING_DIR = OURS_DIR.parent / "HeaRT" / "benchmarking"
+sys.path.insert(0, str(OURS_DIR))
 sys.path.insert(0, str(HEART_BENCHMARKING_DIR))
 
 import argparse
@@ -14,9 +16,10 @@ from torch.utils.data import DataLoader
 from torch_sparse import SparseTensor
 
 from evalutors import evaluate_mrr
-from gnn_model import GCN
 from scoring import mlp_score
 from utils import Logger, get_logger, init_seed
+
+from model import BackboneConfig, ExitConfig, NodeAdaptiveExit, WeightSharedSAS
 
 HEART_DATASET_DIR = HEART_BENCHMARKING_DIR.parent / "dataset"
 
@@ -257,13 +260,13 @@ def main() -> None:
         seed = args.seed if args.runs == 1 else run
         init_seed(seed)
 
-        model = GCN(
-            input_channel,
-            args.hidden_channels,
-            args.hidden_channels,
-            args.num_layers,
-            args.dropout,
-        ).to(device)
+        backbone_config = BackboneConfig(
+            in_channels=input_channel,
+            hidden_channels=args.hidden_channels,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+        )
+        model = WeightSharedSAS(backbone_config).to(device)
 
         score_func = mlp_score(
             args.hidden_channels,
