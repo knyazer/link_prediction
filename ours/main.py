@@ -7,10 +7,9 @@ sys.path.insert(0, str(OURS_DIR))
 sys.path.insert(0, str(HEART_BENCHMARKING_DIR))
 
 import argparse
-import os
+from enum import Enum
 
 import numpy as np
-import scipy.sparse as ssp
 import torch
 from torch.utils.data import DataLoader
 from torch_sparse import SparseTensor
@@ -19,7 +18,13 @@ from evalutors import evaluate_mrr
 from scoring import mlp_score
 from utils import Logger, get_logger, init_seed
 
-from model import BackboneConfig, ExitConfig, NodeAdaptiveExit, WeightSharedSAS
+from model import BackboneConfig, ExitConfig, NodeAdaptiveExit, SubgraphAdaptiveExit, WeightSharedSAS
+
+
+class ExitMode(Enum):
+    NONE = "none"
+    NODE_ADAPTIVE = "node_adaptive"
+    SUBGRAPH_ADAPTIVE = "subgraph_adaptive"
 
 HEART_DATASET_DIR = HEART_BENCHMARKING_DIR.parent / "dataset"
 
@@ -238,7 +243,10 @@ def main() -> None:
     parser.add_argument("--input_dir", type=str, default=str(HEART_DATASET_DIR))
     parser.add_argument("--filename", type=str, default="samples.npy")
     parser.add_argument("--eval_mrr_data_name", type=str, default="ogbl-citation2")
-    parser.add_argument("--early_exit", action="store_true", default=False)
+    parser.add_argument(
+        "--exit_mode", type=lambda s: ExitMode(s), default=ExitMode.NONE,
+        choices=list(ExitMode), metavar="{none,node_adaptive,subgraph_adaptive}",
+    )
     parser.add_argument("--tau0", type=float, default=1.0)
     parser.add_argument("--confidence_hidden_dim", type=int, default=64)
     args = parser.parse_args()
@@ -271,11 +279,15 @@ def main() -> None:
             num_layers=args.num_layers,
             dropout=args.dropout,
         )
-        if args.early_exit:
-            exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
-            model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
-        else:
-            model = WeightSharedSAS(backbone_config).to(device)
+        match args.exit_mode:
+            case ExitMode.NONE:
+                model = WeightSharedSAS(backbone_config).to(device)
+            case ExitMode.NODE_ADAPTIVE:
+                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
+                model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
+            case ExitMode.SUBGRAPH_ADAPTIVE:
+                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
+                model = SubgraphAdaptiveExit(backbone_config, exit_config).to(device)
 
         score_func = mlp_score(
             args.hidden_channels,
