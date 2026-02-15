@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-toml
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=10240]
+        exclude: '\.(parquet|safetensors)$'
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff-check
+        args: [--fix, ours]
+        pass_filenames: false
+      - id: ruff-format
+        args: [ours]
+        pass_filenames: false
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.3
+    hooks:
+      - id: typos
+        exclude: '^(uv\.lock|.*\.parquet|.*\.safetensors)$'
+
