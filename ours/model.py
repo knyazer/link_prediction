@@ -13,6 +13,10 @@ from torch_geometric.utils import degree, remove_self_loops
 from torch_sparse import SparseTensor
 
 
+def relu_tanh(x: Tensor) -> Tensor:
+    return F.relu(torch.tanh(x))
+
+
 @dataclass(frozen=True)
 class BackboneConfig:
     in_channels: int
@@ -25,27 +29,24 @@ class BackboneConfig:
 class ExitConfig:
     tau0: float = 1.0
     confidence_hidden_dim: int = 64
+    hard_gumbel: bool = False
 
 
 class AntiSymmetric(nn.Module):
     def __init__(self, num_features: int):
         super().__init__()
         self.W = nn.Parameter(torch.empty(num_features, num_features))
-        self.bias = nn.Parameter(torch.empty(num_features))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
-        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.W)
-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-        nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Float[Tensor, "nodes features"]) -> Float[Tensor, "nodes features"]:
         antisym_W = self.W - self.W.T
-        return x @ antisym_W.T + self.bias
+        return F.relu(x @ antisym_W.T)
 
 
-class _PairwiseParametrization(nn.Module):
+class PairwiseParametrization(nn.Module):
     def forward(self, W: Float[Tensor, "out_features in_features_plus2"]) -> Float[Tensor, "out_features out_features"]:
         W0 = W[:, :-2].triu(1)
         W0 = W0 + W0.T
@@ -59,7 +60,7 @@ class Pairwise(nn.Module):
     def __init__(self, num_hidden: int):
         super().__init__()
         self.lin = nn.Linear(num_hidden + 2, num_hidden, bias=False)
-        parametrize.register_parametrization(self.lin, "weight", _PairwiseParametrization(), unsafe=True)
+        parametrize.register_parametrization(self.lin, "weight", PairwiseParametrization(), unsafe=True)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -69,7 +70,7 @@ class Pairwise(nn.Module):
         return self.lin(x)
 
 
-def _sparse_tensor_to_edge_index(adj_t: SparseTensor) -> Int[Tensor, "2 edges"]:
+def sparse_tensor_to_edge_index(adj_t: SparseTensor) -> Int[Tensor, "2 edges"]:
     row, col, _ = adj_t.coo()
     return torch.stack([row, col], dim=0)
 
@@ -87,7 +88,7 @@ class SASConv(MessagePassing):
     def forward(
         self, x: Float[Tensor, "nodes features"], adj_t: SparseTensor | Int[Tensor, "2 edges"]
     ) -> Float[Tensor, "nodes features"]:
-        edge_index = _sparse_tensor_to_edge_index(adj_t) if isinstance(adj_t, SparseTensor) else adj_t
+        edge_index = sparse_tensor_to_edge_index(adj_t) if isinstance(adj_t, SparseTensor) else adj_t
 
         out = self.symmetric_aggr(x)
         edge_index_no_self, _ = remove_self_loops(edge_index)
@@ -120,11 +121,11 @@ class WeightSharedSAS(nn.Module):
     def forward(
         self, x: Float[Tensor, "nodes in_features"], adj_t: SparseTensor | Int[Tensor, "2 edges"]
     ) -> Float[Tensor, "nodes hidden"]:
-        x = F.gelu(self.input_proj(x.float()))
+        x = F.relu(self.input_proj(x.float()))
         x = F.dropout(x, p=self.config.dropout, training=self.training)
         for _ in range(self.config.num_layers):
             delta = self.conv(x, adj_t)
-            x = x + F.gelu(delta)
+            x = x + relu_tanh(delta)
         return x
 
 
@@ -133,8 +134,7 @@ class ConfidenceHead(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 2),
         )
 
@@ -194,13 +194,13 @@ class NodeAdaptiveExit(nn.Module):
         num_nodes = x.size(0)
         device = x.device
         num_layers = self.backbone_config.num_layers
+        hard = self.exit_config.hard_gumbel
 
-        x = F.gelu(self.input_proj(x.float()))
+        x = F.relu(self.input_proj(x.float()))
         x = F.dropout(x, p=self.backbone_config.dropout, training=self.training)
 
         z = torch.zeros_like(x)
         continue_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
-        step_size = torch.ones(num_nodes, 1, device=device)
         exit_layers = torch.full((num_nodes,), num_layers, dtype=torch.long, device=device)
         active_nodes_per_layer: list[int] = []
 
@@ -209,10 +209,9 @@ class NodeAdaptiveExit(nn.Module):
 
             logits = self.confidence_head(x)
             temp = self.temperature_head(x)
-            gumbel_out = F.gumbel_softmax(logits=logits, tau=temp, hard=True)
+            gumbel_out = F.gumbel_softmax(logits=logits, tau=temp, hard=hard)
 
-            tau = gumbel_out[:, 0:1]
-            step_size = step_size * tau
+            step_size = gumbel_out[:, 0:1]
 
             exit_decision = gumbel_out[:, 1] > gumbel_out[:, 0]
             newly_exited = torch.logical_and(exit_decision, continue_mask)
@@ -222,7 +221,7 @@ class NodeAdaptiveExit(nn.Module):
             continue_mask = torch.logical_and(continue_mask, torch.logical_not(exit_decision))
 
             delta = self.conv(x, adj_t)
-            x = x + step_size * F.gelu(delta)
+            x = x + step_size * relu_tanh(delta)
 
         z = z + x * continue_mask[:, None].float()
 
@@ -238,8 +237,7 @@ class HardExitHead(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim + 1, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 2),
         )
 
@@ -254,7 +252,7 @@ class HardExitHead(nn.Module):
         return self.mlp(torch.cat([x, readiness], dim=-1))
 
 
-def _compute_neighbor_readiness(
+def compute_neighbor_readiness(
     soft_exited: Bool[Tensor, " nodes"], edge_index: Int[Tensor, "2 edges"], num_nodes: int
 ) -> Float[Tensor, "nodes 1"]:
     row, col = edge_index
@@ -297,17 +295,17 @@ class SubgraphAdaptiveExit(nn.Module):
         num_nodes = x.size(0)
         device = x.device
         num_layers = self.backbone_config.num_layers
+        hard = self.exit_config.hard_gumbel
 
-        edge_index = _sparse_tensor_to_edge_index(adj_t) if isinstance(adj_t, SparseTensor) else adj_t
+        edge_index = sparse_tensor_to_edge_index(adj_t) if isinstance(adj_t, SparseTensor) else adj_t
         edge_index_no_self, _ = remove_self_loops(edge_index)
 
-        x = F.gelu(self.input_proj(x.float()))
+        x = F.relu(self.input_proj(x.float()))
         x = F.dropout(x, p=self.backbone_config.dropout, training=self.training)
 
         z = torch.zeros_like(x)
         soft_exited = torch.zeros(num_nodes, dtype=torch.bool, device=device)
         hard_exited = torch.zeros(num_nodes, dtype=torch.bool, device=device)
-        step_size = torch.ones(num_nodes, 1, device=device)
         exit_layers = torch.full((num_nodes,), num_layers, dtype=torch.long, device=device)
         active_nodes_per_layer: list[int] = []
 
@@ -317,12 +315,12 @@ class SubgraphAdaptiveExit(nn.Module):
             temp = self.temperature_head(x)
 
             soft_logits = self.soft_exit_head(x)
-            soft_gumbel = F.gumbel_softmax(logits=soft_logits, tau=temp, hard=True)
+            soft_gumbel = F.gumbel_softmax(logits=soft_logits, tau=temp, hard=hard)
             soft_exit_decision = soft_gumbel[:, 1] > soft_gumbel[:, 0]
             newly_soft = torch.logical_and(soft_exit_decision, torch.logical_not(soft_exited))
             soft_exited = torch.logical_or(soft_exited, newly_soft)
 
-            readiness = _compute_neighbor_readiness(soft_exited, edge_index_no_self, num_nodes).detach()
+            readiness = compute_neighbor_readiness(soft_exited, edge_index_no_self, num_nodes).detach()
             hard_logits = self.hard_exit_head(x, readiness)
 
             continue_logits = torch.zeros(num_nodes, 2, device=device)
@@ -331,18 +329,17 @@ class SubgraphAdaptiveExit(nn.Module):
                 soft_exited[:, None], hard_logits, continue_logits
             )
 
-            hard_gumbel = F.gumbel_softmax(logits=effective_hard_logits, tau=temp, hard=True)
-            tau = hard_gumbel[:, 0:1]
-            step_size = step_size * tau
+            hard_gumbel_out = F.gumbel_softmax(logits=effective_hard_logits, tau=temp, hard=hard)
+            step_size = hard_gumbel_out[:, 0:1]
 
-            hard_exit_decision = hard_gumbel[:, 1] > hard_gumbel[:, 0]
+            hard_exit_decision = hard_gumbel_out[:, 1] > hard_gumbel_out[:, 0]
             newly_hard = torch.logical_and(hard_exit_decision, torch.logical_not(hard_exited))
             z = z + x * newly_hard[:, None].float()
             exit_layers = torch.where(newly_hard, torch.tensor(layer_idx, device=device), exit_layers)
             hard_exited = torch.logical_or(hard_exited, newly_hard)
 
             delta = self.conv(x, adj_t)
-            x = x + step_size * F.gelu(delta)
+            x = x + step_size * relu_tanh(delta)
 
         z = z + x * torch.logical_not(hard_exited)[:, None].float()
 

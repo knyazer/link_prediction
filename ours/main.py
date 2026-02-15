@@ -249,6 +249,7 @@ def main() -> None:
     )
     parser.add_argument("--tau0", type=float, default=1.0)
     parser.add_argument("--confidence_hidden_dim", type=int, default=64)
+    parser.add_argument("--hard_gumbel", action="store_true", default=False)
     args = parser.parse_args()
 
     print(args)
@@ -283,10 +284,10 @@ def main() -> None:
             case ExitMode.NONE:
                 model = WeightSharedSAS(backbone_config).to(device)
             case ExitMode.NODE_ADAPTIVE:
-                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
+                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim, hard_gumbel=args.hard_gumbel)
                 model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
             case ExitMode.SUBGRAPH_ADAPTIVE:
-                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim)
+                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim, hard_gumbel=args.hard_gumbel)
                 model = SubgraphAdaptiveExit(backbone_config, exit_config).to(device)
 
         score_func = mlp_score(

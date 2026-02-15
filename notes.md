@@ -1,0 +1,1 @@
+- You don't mention batch-size anywhere in the paper?
