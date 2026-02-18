@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import GCNConv, MessagePassing
 from torch_geometric.utils import degree, remove_self_loops
 from torch_sparse import SparseTensor
 
@@ -340,6 +340,185 @@ class SubgraphAdaptiveExit(nn.Module):
 
             delta = self.conv(x, adj_t)
             x = x + step_size * relu_tanh(delta)
+
+        z = z + x * torch.logical_not(hard_exited)[:, None].float()
+
+        return ForwardResult(
+            node_embeddings=z,
+            exit_layers=exit_layers,
+            active_nodes_per_layer=active_nodes_per_layer,
+        )
+
+
+# ── GCN backbone (independent per-layer weights, matching HeaRT GCN) ──
+
+
+class GCNBackbone(nn.Module):
+    def __init__(self, config: BackboneConfig):
+        super().__init__()
+        self.config = config
+        h = config.hidden_channels
+
+        self.convs = nn.ModuleList()
+        if config.num_layers == 1:
+            self.convs.append(GCNConv(config.in_channels, h))
+        else:
+            self.convs.append(GCNConv(config.in_channels, h))
+            for _ in range(config.num_layers - 2):
+                self.convs.append(GCNConv(h, h))
+            self.convs.append(GCNConv(h, h))
+
+    def reset_parameters(self) -> None:
+        for conv in self.convs:
+            conv.reset_parameters()
+
+    def forward(
+        self, x: Float[Tensor, "nodes in_features"], adj_t: SparseTensor | Int[Tensor, "2 edges"]
+    ) -> Float[Tensor, "nodes hidden"]:
+        for conv in self.convs[:-1]:
+            x = conv(x.float(), adj_t)
+            x = F.gelu(x)
+            x = F.dropout(x, p=self.config.dropout, training=self.training)
+        x = self.convs[-1](x, adj_t)
+        return x
+
+
+class GCNNodeAdaptiveExit(nn.Module):
+    def __init__(self, backbone_config: BackboneConfig, exit_config: ExitConfig):
+        super().__init__()
+        self.backbone_config = backbone_config
+        self.exit_config = exit_config
+        h = backbone_config.hidden_channels
+
+        self.convs = nn.ModuleList()
+        self.convs.append(GCNConv(backbone_config.in_channels, h))
+        for _ in range(backbone_config.num_layers - 1):
+            self.convs.append(GCNConv(h, h))
+
+        self.confidence_head = ConfidenceHead(h, exit_config.confidence_hidden_dim)
+        self.temperature_head = TemperatureHead(h, exit_config.tau0)
+
+    def reset_parameters(self) -> None:
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.confidence_head.reset_parameters()
+        self.temperature_head.reset_parameters()
+
+    def forward(
+        self, x: Float[Tensor, "nodes in_features"], adj_t: SparseTensor | Int[Tensor, "2 edges"]
+    ) -> ForwardResult:
+        num_nodes = x.size(0)
+        device = x.device
+        num_layers = self.backbone_config.num_layers
+        hard = self.exit_config.hard_gumbel
+
+        z = torch.zeros(num_nodes, self.backbone_config.hidden_channels, device=device)
+        continue_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
+        exit_layers = torch.full((num_nodes,), num_layers, dtype=torch.long, device=device)
+        active_nodes_per_layer: list[int] = []
+
+        for layer_idx in range(num_layers):
+            x = self.convs[layer_idx](x.float(), adj_t)
+
+            if layer_idx < num_layers - 1:
+                x = F.gelu(x)
+                x = F.dropout(x, p=self.backbone_config.dropout, training=self.training)
+
+            active_nodes_per_layer.append(int(continue_mask.sum().item()))
+
+            logits = self.confidence_head(x)
+            temp = self.temperature_head(x)
+            gumbel_out = F.gumbel_softmax(logits=logits, tau=temp, hard=hard)
+
+            exit_decision = gumbel_out[:, 1] > gumbel_out[:, 0]
+            newly_exited = torch.logical_and(exit_decision, continue_mask)
+            z = z + x * newly_exited[:, None].float()
+            exit_layers = torch.where(newly_exited, torch.tensor(layer_idx, device=device), exit_layers)
+
+            continue_mask = torch.logical_and(continue_mask, torch.logical_not(exit_decision))
+
+        z = z + x * continue_mask[:, None].float()
+
+        return ForwardResult(
+            node_embeddings=z,
+            exit_layers=exit_layers,
+            active_nodes_per_layer=active_nodes_per_layer,
+        )
+
+
+class GCNSubgraphAdaptiveExit(nn.Module):
+    def __init__(self, backbone_config: BackboneConfig, exit_config: ExitConfig):
+        super().__init__()
+        self.backbone_config = backbone_config
+        self.exit_config = exit_config
+        h = backbone_config.hidden_channels
+
+        self.convs = nn.ModuleList()
+        self.convs.append(GCNConv(backbone_config.in_channels, h))
+        for _ in range(backbone_config.num_layers - 1):
+            self.convs.append(GCNConv(h, h))
+
+        self.soft_exit_head = ConfidenceHead(h, exit_config.confidence_hidden_dim)
+        self.hard_exit_head = HardExitHead(h, exit_config.confidence_hidden_dim)
+        self.temperature_head = TemperatureHead(h, exit_config.tau0)
+
+    def reset_parameters(self) -> None:
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.soft_exit_head.reset_parameters()
+        self.hard_exit_head.reset_parameters()
+        self.temperature_head.reset_parameters()
+
+    def forward(
+        self, x: Float[Tensor, "nodes in_features"], adj_t: SparseTensor | Int[Tensor, "2 edges"]
+    ) -> ForwardResult:
+        num_nodes = x.size(0)
+        device = x.device
+        num_layers = self.backbone_config.num_layers
+        hard = self.exit_config.hard_gumbel
+
+        edge_index = sparse_tensor_to_edge_index(adj_t) if isinstance(adj_t, SparseTensor) else adj_t
+        edge_index_no_self, _ = remove_self_loops(edge_index)
+
+        z = torch.zeros(num_nodes, self.backbone_config.hidden_channels, device=device)
+        soft_exited = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        hard_exited = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        exit_layers = torch.full((num_nodes,), num_layers, dtype=torch.long, device=device)
+        active_nodes_per_layer: list[int] = []
+
+        for layer_idx in range(num_layers):
+            x = self.convs[layer_idx](x.float(), adj_t)
+
+            if layer_idx < num_layers - 1:
+                x = F.gelu(x)
+                x = F.dropout(x, p=self.backbone_config.dropout, training=self.training)
+
+            active_nodes_per_layer.append(int(torch.logical_not(hard_exited).sum().item()))
+
+            temp = self.temperature_head(x)
+
+            soft_logits = self.soft_exit_head(x)
+            soft_gumbel = F.gumbel_softmax(logits=soft_logits, tau=temp, hard=hard)
+            soft_exit_decision = soft_gumbel[:, 1] > soft_gumbel[:, 0]
+            newly_soft = torch.logical_and(soft_exit_decision, torch.logical_not(soft_exited))
+            soft_exited = torch.logical_or(soft_exited, newly_soft)
+
+            readiness = compute_neighbor_readiness(soft_exited, edge_index_no_self, num_nodes).detach()
+            hard_logits = self.hard_exit_head(x, readiness)
+
+            continue_logits = torch.zeros(num_nodes, 2, device=device)
+            continue_logits[:, 0] = 1e6
+            effective_hard_logits = torch.where(
+                soft_exited[:, None], hard_logits, continue_logits
+            )
+
+            hard_gumbel_out = F.gumbel_softmax(logits=effective_hard_logits, tau=temp, hard=hard)
+
+            hard_exit_decision = hard_gumbel_out[:, 1] > hard_gumbel_out[:, 0]
+            newly_hard = torch.logical_and(hard_exit_decision, torch.logical_not(hard_exited))
+            z = z + x * newly_hard[:, None].float()
+            exit_layers = torch.where(newly_hard, torch.tensor(layer_idx, device=device), exit_layers)
+            hard_exited = torch.logical_or(hard_exited, newly_hard)
 
         z = z + x * torch.logical_not(hard_exited)[:, None].float()
 

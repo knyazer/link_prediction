@@ -23,7 +23,7 @@ class TrainConfig:
     data_name: str
     exit_mode: ExitMode
     num_layers: int = 12
-    hidden_channels: int = 32
+    hidden_channels: int = 256
     dropout: float = 0.2
     tau0: float = 0.0
     confidence_hidden_dim: int = 32

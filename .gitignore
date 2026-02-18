@@ -8,3 +8,5 @@ hooks
 objects
 refs
 HEAD
+checkpoints
+results

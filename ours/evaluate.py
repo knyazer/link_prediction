@@ -230,7 +230,10 @@ def find_compute_balanced_L(
     best_l = 1
     best_diff = float("inf")
 
-    for num_layers in range(1, 13):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    max_layers = checkpoint["backbone_config"]["num_layers"]
+
+    for num_layers in range(1, max_layers + 1):
         init_seed(999)
         model, _, _ = load_model_from_checkpoint(checkpoint_path, device, override_num_layers=num_layers)
         model.eval()
@@ -252,7 +255,7 @@ def find_compute_balanced_L(
 
 
 def main() -> None:
-    device = torch.device("cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     results: list[EvalResult] = []
     compute_balanced_info: dict[str, dict] = {}
 
