@@ -1,71 +1,37 @@
-"""Comprehensive experiment runner.
-
-Tunes hyperparameters for all (dataset, exit_mode) combinations,
-trains final models, evaluates them, and generates plots.
-All experiments run SEQUENTIALLY to avoid crashes.
-"""
-
 import json
-import sys
-from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 
-OURS_DIR = Path(__file__).resolve().parent
-HEART_BENCHMARKING_DIR = OURS_DIR.parent / "HeaRT" / "benchmarking"
-sys.path.insert(0, str(OURS_DIR))
-sys.path.insert(0, str(HEART_BENCHMARKING_DIR))
+from shared import (
+    CHECKPOINTS_DIR,
+    HEART_DATASET_DIR,
+    RESULTS_DIR,
+    ExitMode,
+    HyperConfig,
+    build_sas_model,
+    config_key,
+    load_tuning_cache,
+    save_checkpoint,
+    save_tuning_cache,
+)
 
 import torch
 
-from main import ExitMode, read_data, train, test
-from model import BackboneConfig, ExitConfig, NodeAdaptiveExit, SubgraphAdaptiveExit, WeightSharedSAS
+from main import read_data, train, test
+from model import BackboneConfig, ExitConfig
 from scoring import mlp_score
 from utils import init_seed
 
-HEART_DATASET_DIR = HEART_BENCHMARKING_DIR.parent / "dataset"
-CHECKPOINTS_DIR = OURS_DIR.parent / "checkpoints"
-RESULTS_DIR = OURS_DIR.parent / "results"
-TUNING_CACHE = RESULTS_DIR / "tuning_cache.json"
 
-
-@dataclass(frozen=True)
-class HyperConfig:
-    num_layers: int
-    dropout: float
-    lr: float
-    tau0: float
-    confidence_hidden_dim: int = 32
-    hidden_channels: int = 256
-    num_layers_predictor: int = 3
-    batch_size: int = 1024
-    epochs: int = 150
-    eval_steps: int = 5
-    kill_cnt: int = 10
-    seed: int = 999
-
-
-def config_key(dataset: str, exit_mode: ExitMode, config: HyperConfig) -> str:
-    return f"{dataset}_{exit_mode.value}_L{config.num_layers}_d{config.dropout}_lr{config.lr}_tau{config.tau0}"
-
-
-def load_tuning_cache() -> dict:
-    if TUNING_CACHE.exists():
-        with open(TUNING_CACHE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_tuning_cache(cache: dict) -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(TUNING_CACHE, "w") as f:
-        json.dump(cache, f, indent=2)
-
-
-def tune_single(
-    dataset: str, exit_mode: ExitMode, config: HyperConfig, data: dict, device: torch.device,
-) -> tuple[float, float]:
-    """Train with given config, return (best_val_mrr, test_mrr_at_best_val)."""
+def train_sas_model(
+    dataset: str,
+    exit_mode: ExitMode,
+    config: HyperConfig,
+    data: dict,
+    device: torch.device,
+    save: bool = False,
+    l2: float = 0.0,
+) -> tuple[float, float, Path | None]:
     init_seed(config.seed)
 
     x = data["x"].to(device)
@@ -79,19 +45,19 @@ def tune_single(
         dropout=config.dropout,
     )
 
-    match exit_mode:
-        case ExitMode.NONE:
-            model = WeightSharedSAS(backbone_config).to(device)
-        case ExitMode.NODE_ADAPTIVE:
-            exit_config = ExitConfig(tau0=config.tau0, confidence_hidden_dim=config.confidence_hidden_dim)
-            model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
-        case ExitMode.SUBGRAPH_ADAPTIVE:
-            exit_config = ExitConfig(tau0=config.tau0, confidence_hidden_dim=config.confidence_hidden_dim)
-            model = SubgraphAdaptiveExit(backbone_config, exit_config).to(device)
+    exit_config = (
+        ExitConfig(tau0=config.tau0, confidence_hidden_dim=config.confidence_hidden_dim)
+        if exit_mode != ExitMode.NONE
+        else None
+    )
+    model = build_sas_model(backbone_config, exit_mode, exit_config).to(device)
 
     score_func = mlp_score(
-        config.hidden_channels, config.hidden_channels, 1,
-        config.num_layers_predictor, config.dropout,
+        config.hidden_channels,
+        config.hidden_channels,
+        1,
+        config.num_layers_predictor,
+        config.dropout,
     ).to(device)
 
     model.reset_parameters()
@@ -100,17 +66,22 @@ def tune_single(
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(score_func.parameters()),
         lr=config.lr,
+        weight_decay=l2,
     )
 
     from ogb.linkproppred import Evaluator
+
     evaluator_mrr = Evaluator(name="ogbl-citation2")
 
     best_val_mrr = 0.0
-    test_mrr_at_best_val = 0.0
+    test_mrr_at_best = 0.0
     kill_cnt = 0
+    best_model_state: dict | None = None
+    best_score_state: dict | None = None
+    best_epoch = 0
 
     for epoch in range(1, 1 + config.epochs):
-        loss = train(model, score_func, train_pos, x, optimizer, config.batch_size)
+        train(model, score_func, train_pos, x, optimizer, config.batch_size)
 
         if epoch % config.eval_steps == 0:
             results = test(model, score_func, data, x, evaluator_mrr, config.batch_size)
@@ -119,114 +90,38 @@ def tune_single(
 
             if val_mrr > best_val_mrr:
                 best_val_mrr = val_mrr
-                test_mrr_at_best_val = test_mrr
+                test_mrr_at_best = test_mrr
                 kill_cnt = 0
+                if save:
+                    best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    best_score_state = {k: v.cpu().clone() for k, v in score_func.state_dict().items()}
+                    best_epoch = epoch
             else:
                 kill_cnt += 1
                 if kill_cnt > config.kill_cnt:
+                    if save:
+                        print(f"  Early stopping at epoch {epoch}")
                     break
 
-    return best_val_mrr, test_mrr_at_best_val
+    save_path = None
+    if save and best_model_state is not None and best_score_state is not None:
+        save_path = CHECKPOINTS_DIR / f"{dataset}_{exit_mode.value}_L{config.num_layers}.pt"
+        save_checkpoint(
+            save_path=save_path,
+            model_state=best_model_state,
+            score_state=best_score_state,
+            backbone_config=backbone_config,
+            exit_mode=exit_mode,
+            dataset=dataset,
+            tau0=config.tau0,
+            confidence_hidden_dim=config.confidence_hidden_dim,
+            num_layers_predictor=config.num_layers_predictor,
+            best_epoch=best_epoch,
+        )
+        print(f"  Saved {save_path.name} (epoch {best_epoch}, val MRR: {best_val_mrr:.4f})")
 
+    return best_val_mrr, test_mrr_at_best, save_path
 
-def train_and_save_final(
-    dataset: str, exit_mode: ExitMode, config: HyperConfig, data: dict, device: torch.device,
-) -> Path:
-    """Train with given config and save checkpoint."""
-    init_seed(config.seed)
-
-    x = data["x"].to(device)
-    train_pos = data["train_pos"].to(device)
-    input_channel = x.size(1)
-
-    backbone_config = BackboneConfig(
-        in_channels=input_channel,
-        hidden_channels=config.hidden_channels,
-        num_layers=config.num_layers,
-        dropout=config.dropout,
-    )
-
-    match exit_mode:
-        case ExitMode.NONE:
-            model = WeightSharedSAS(backbone_config).to(device)
-        case ExitMode.NODE_ADAPTIVE:
-            exit_config = ExitConfig(tau0=config.tau0, confidence_hidden_dim=config.confidence_hidden_dim)
-            model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
-        case ExitMode.SUBGRAPH_ADAPTIVE:
-            exit_config = ExitConfig(tau0=config.tau0, confidence_hidden_dim=config.confidence_hidden_dim)
-            model = SubgraphAdaptiveExit(backbone_config, exit_config).to(device)
-
-    score_func = mlp_score(
-        config.hidden_channels, config.hidden_channels, 1,
-        config.num_layers_predictor, config.dropout,
-    ).to(device)
-
-    model.reset_parameters()
-    score_func.reset_parameters()
-
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(score_func.parameters()),
-        lr=config.lr,
-    )
-
-    from ogb.linkproppred import Evaluator
-    evaluator_mrr = Evaluator(name="ogbl-citation2")
-
-    best_valid = 0.0
-    kill_cnt = 0
-    best_model_state: dict | None = None
-    best_score_state: dict | None = None
-    best_epoch = 0
-
-    for epoch in range(1, 1 + config.epochs):
-        loss = train(model, score_func, train_pos, x, optimizer, config.batch_size)
-
-        if epoch % config.eval_steps == 0:
-            results = test(model, score_func, data, x, evaluator_mrr, config.batch_size)
-            val_mrr = results["MRR"][1]
-
-            if val_mrr > best_valid:
-                best_valid = val_mrr
-                kill_cnt = 0
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                best_score_state = {k: v.cpu().clone() for k, v in score_func.state_dict().items()}
-                best_epoch = epoch
-            else:
-                kill_cnt += 1
-                if kill_cnt > config.kill_cnt:
-                    print(f"  Early stopping at epoch {epoch}")
-                    break
-
-    assert best_model_state is not None
-    assert best_score_state is not None
-
-    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    save_path = CHECKPOINTS_DIR / f"{dataset}_{exit_mode.value}_L{config.num_layers}.pt"
-
-    torch.save({
-        "model_state_dict": best_model_state,
-        "score_func_state_dict": best_score_state,
-        "backbone_config": {
-            "in_channels": backbone_config.in_channels,
-            "hidden_channels": backbone_config.hidden_channels,
-            "num_layers": backbone_config.num_layers,
-            "dropout": backbone_config.dropout,
-        },
-        "exit_mode": exit_mode.value,
-        "data_name": dataset,
-        "tau0": config.tau0,
-        "confidence_hidden_dim": config.confidence_hidden_dim,
-        "num_layers_predictor": config.num_layers_predictor,
-        "best_epoch": best_epoch,
-    }, save_path)
-
-    print(f"  Saved {save_path.name} (epoch {best_epoch}, val MRR: {best_valid:.4f})")
-    return save_path
-
-
-# ============================================================================
-# Hyperparameter grids
-# ============================================================================
 
 BASELINE_GRID: dict[str, list[HyperConfig]] = {
     "cora": [
@@ -252,7 +147,6 @@ EXIT_GRID: dict[str, list[HyperConfig]] = {
 
 
 def phase_tune() -> dict[str, dict[str, tuple[HyperConfig, float, float]]]:
-    """Phase 1: Grid search for all (dataset, mode) combos."""
     print("\n" + "=" * 70)
     print("PHASE 1: HYPERPARAMETER TUNING")
     print("=" * 70)
@@ -279,10 +173,10 @@ def phase_tune() -> dict[str, dict[str, tuple[HyperConfig, float, float]]]:
 
                 if key in cache:
                     val_mrr, test_mrr = cache[key]["val_mrr"], cache[key]["test_mrr"]
-                    print(f"  [{i+1}/{len(grid)}] {key} (cached): val={val_mrr:.4f}, test={test_mrr:.4f}")
+                    print(f"  [{i + 1}/{len(grid)}] {key} (cached): val={val_mrr:.4f}, test={test_mrr:.4f}")
                 else:
-                    print(f"  [{i+1}/{len(grid)}] {key}: training...", end=" ", flush=True)
-                    val_mrr, test_mrr = tune_single(dataset, exit_mode, cfg, data, device)
+                    print(f"  [{i + 1}/{len(grid)}] {key}: training...", end=" ", flush=True)
+                    val_mrr, test_mrr, _ = train_sas_model(dataset, exit_mode, cfg, data, device)
                     cache[key] = {"val_mrr": val_mrr, "test_mrr": test_mrr}
                     save_tuning_cache(cache)
                     print(f"val={val_mrr:.4f}, test={test_mrr:.4f}")
@@ -294,8 +188,10 @@ def phase_tune() -> dict[str, dict[str, tuple[HyperConfig, float, float]]]:
 
             assert best_cfg is not None
             best_configs[dataset][exit_mode.value] = (best_cfg, best_val, best_test)
-            print(f"  BEST: L={best_cfg.num_layers}, do={best_cfg.dropout}, "
-                  f"tau0={best_cfg.tau0}, val={best_val:.4f}, test={best_test:.4f}")
+            print(
+                f"  BEST: L={best_cfg.num_layers}, do={best_cfg.dropout}, "
+                f"tau0={best_cfg.tau0}, val={best_val:.4f}, test={best_test:.4f}"
+            )
 
     return best_configs
 
@@ -303,7 +199,6 @@ def phase_tune() -> dict[str, dict[str, tuple[HyperConfig, float, float]]]:
 def phase_train(
     best_configs: dict[str, dict[str, tuple[HyperConfig, float, float]]],
 ) -> dict[str, dict[str, int]]:
-    """Phase 2: Train final models with best configs and save checkpoints."""
     print("\n" + "=" * 70)
     print("PHASE 2: FINAL TRAINING")
     print("=" * 70)
@@ -320,20 +215,20 @@ def phase_train(
             print(f"\n--- Training final {exit_mode.value} on {dataset} ---")
             print(f"  Config: L={cfg.num_layers}, do={cfg.dropout}, tau0={cfg.tau0}, lr={cfg.lr}")
 
-            train_and_save_final(dataset, exit_mode, cfg, data, device)
+            train_sas_model(dataset, exit_mode, cfg, data, device, save=True)
             layer_counts[dataset][exit_mode.value] = cfg.num_layers
 
     return layer_counts
 
 
 def phase_evaluate(layer_counts: dict[str, dict[str, int]]) -> None:
-    """Phase 3: Run evaluation on all checkpoints."""
     print("\n" + "=" * 70)
     print("PHASE 3: EVALUATION")
     print("=" * 70)
 
-    from evaluate import evaluate_model, find_compute_balanced_L, RESULTS_DIR as EVAL_RESULTS_DIR
     from dataclasses import asdict
+
+    from evaluate import evaluate_model, find_compute_balanced_L
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     results = []
@@ -348,14 +243,13 @@ def phase_evaluate(layer_counts: dict[str, dict[str, int]]) -> None:
             print(f"\nEvaluating {exit_mode.value} on {dataset} (L={num_layers})...")
             result = evaluate_model(ckpt, data, device)
             results.append(result)
-            print(f"  MRR={result.test_mrr:.4f}, Hits@1={result.test_hits_at_1:.4f}, "
-                  f"Hits@10={result.test_hits_at_10:.4f}, cost={result.total_compute_cost:.0f}")
+            print(
+                f"  MRR={result.test_mrr:.4f}, Hits@1={result.test_hits_at_1:.4f}, "
+                f"Hits@10={result.test_hits_at_10:.4f}, cost={result.total_compute_cost:.0f}"
+            )
 
         node_l = layer_counts[dataset]["node_adaptive"]
-        node_result = next(
-            r for r in results
-            if r.dataset == dataset and r.model_type == "node_adaptive"
-        )
+        node_result = next(r for r in results if r.dataset == dataset and r.model_type == "node_adaptive")
 
         sub_l = layer_counts[dataset]["subgraph_adaptive"]
         sub_ckpt = CHECKPOINTS_DIR / f"{dataset}_subgraph_adaptive_L{sub_l}.pt"
@@ -387,12 +281,12 @@ def phase_evaluate(layer_counts: dict[str, dict[str, int]]) -> None:
 
 
 def phase_plot(layer_counts: dict[str, dict[str, int]]) -> None:
-    """Phase 4: Generate all plots."""
     print("\n" + "=" * 70)
     print("PHASE 4: PLOTTING")
     print("=" * 70)
 
     from plot import plot_dataset_with_layers
+
     for dataset in ["cora", "citeseer"]:
         plot_dataset_with_layers(dataset, layer_counts[dataset])
 
@@ -401,7 +295,6 @@ def phase_update_tables(
     best_configs: dict[str, dict[str, tuple[HyperConfig, float, float]]],
     layer_counts: dict[str, dict[str, int]],
 ) -> None:
-    """Phase 5: Update results tables and progress files."""
     print("\n" + "=" * 70)
     print("PHASE 5: UPDATING TABLES")
     print("=" * 70)
@@ -417,9 +310,11 @@ def phase_update_tables(
             if result_file.exists():
                 with open(result_file) as f:
                     result = json.load(f)
-                print(f"  {dataset} {exit_mode.value}: MRR={result['test_mrr']:.4f}, "
-                      f"Hits@1={result['test_hits_at_1']:.4f}, Hits@10={result['test_hits_at_10']:.4f}, "
-                      f"cost={result['total_compute_cost']:.0f}")
+                print(
+                    f"  {dataset} {exit_mode.value}: MRR={result['test_mrr']:.4f}, "
+                    f"Hits@1={result['test_hits_at_1']:.4f}, Hits@10={result['test_hits_at_10']:.4f}, "
+                    f"cost={result['total_compute_cost']:.0f}"
+                )
 
     ours_md = tables_dir / "ours.md"
     lines = ["# Our Results vs HeaRT Baselines\n"]
@@ -466,8 +361,8 @@ def phase_update_tables(
                 }[exit_mode]
 
                 lines.append(
-                    f"| {mode_label} | {r['test_mrr']*100:.2f} | "
-                    f"{r['test_hits_at_1']*100:.2f} | {r['test_hits_at_10']*100:.2f} | {cost_str} |"
+                    f"| {mode_label} | {r['test_mrr'] * 100:.2f} | "
+                    f"{r['test_hits_at_1'] * 100:.2f} | {r['test_hits_at_10'] * 100:.2f} | {cost_str} |"
                 )
         lines.append("")
 
@@ -476,7 +371,6 @@ def phase_update_tables(
 
     print(f"  Updated {ours_md}")
 
-    # Save best configs summary
     config_summary = {}
     for dataset in ["cora", "citeseer"]:
         config_summary[dataset] = {}

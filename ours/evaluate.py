@@ -1,32 +1,23 @@
 import json
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-OURS_DIR = Path(__file__).resolve().parent
-HEART_BENCHMARKING_DIR = OURS_DIR.parent / "HeaRT" / "benchmarking"
-sys.path.insert(0, str(OURS_DIR))
-sys.path.insert(0, str(HEART_BENCHMARKING_DIR))
+from shared import (
+    CHECKPOINTS_DIR,
+    HEART_DATASET_DIR,
+    RESULTS_DIR,
+    ExitMode,
+    build_sas_model,
+)
 
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 
-from main import ExitMode, get_metric_score, read_data, test_edge
-from model import (
-    BackboneConfig,
-    ExitConfig,
-    ForwardResult,
-    NodeAdaptiveExit,
-    SubgraphAdaptiveExit,
-    WeightSharedSAS,
-)
+from main import get_metric_score, read_data, test_edge
+from model import BackboneConfig, ExitConfig, ForwardResult
 from scoring import mlp_score
 from utils import init_seed
-
-HEART_DATASET_DIR = HEART_BENCHMARKING_DIR.parent / "dataset"
-CHECKPOINTS_DIR = OURS_DIR.parent / "checkpoints"
-RESULTS_DIR = OURS_DIR.parent / "results"
 
 
 @dataclass
@@ -41,6 +32,8 @@ class EvalResult:
     test_hits_at_100: float
     exit_distribution: list[int]
     active_nodes_per_layer: list[int]
+    active_edges_per_layer: list[int]
+    flops_per_layer: list[float]
     edge_fraction_by_layer: list[float]
     cumulative_compute_cost: list[float]
     total_compute_cost: float
@@ -49,7 +42,9 @@ class EvalResult:
 
 
 def load_model_from_checkpoint(
-    checkpoint_path: Path, device: torch.device, override_num_layers: int | None = None,
+    checkpoint_path: Path,
+    device: torch.device,
+    override_num_layers: int | None = None,
 ) -> tuple[torch.nn.Module, torch.nn.Module, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
@@ -63,28 +58,48 @@ def load_model_from_checkpoint(
     )
 
     exit_mode = ExitMode(checkpoint["exit_mode"])
-    match exit_mode:
-        case ExitMode.NONE:
-            model = WeightSharedSAS(backbone_config)
-        case ExitMode.NODE_ADAPTIVE:
-            exit_config = ExitConfig(
-                tau0=checkpoint["tau0"],
-                confidence_hidden_dim=checkpoint["confidence_hidden_dim"],
-            )
-            model = NodeAdaptiveExit(backbone_config, exit_config)
-        case ExitMode.SUBGRAPH_ADAPTIVE:
-            exit_config = ExitConfig(
-                tau0=checkpoint["tau0"],
-                confidence_hidden_dim=checkpoint["confidence_hidden_dim"],
-            )
-            model = SubgraphAdaptiveExit(backbone_config, exit_config)
+    exit_config = (
+        ExitConfig(
+            tau0=checkpoint["tau0"],
+            confidence_hidden_dim=checkpoint["confidence_hidden_dim"],
+        )
+        if exit_mode != ExitMode.NONE
+        else None
+    )
+
+    backbone_type = checkpoint.get("backbone_type")
+    if backbone_type == "gcn":
+        from model import GCNBackbone, GCNNodeAdaptiveExit, GCNSubgraphAdaptiveExit
+
+        match exit_mode:
+            case ExitMode.NONE:
+                model = GCNBackbone(backbone_config)
+            case ExitMode.NODE_ADAPTIVE:
+                model = GCNNodeAdaptiveExit(backbone_config, exit_config)
+            case ExitMode.SUBGRAPH_ADAPTIVE:
+                model = GCNSubgraphAdaptiveExit(backbone_config, exit_config)
+    elif backbone_type == "residual_gcn":
+        from model import GCNResidualBackbone, GCNResidualNodeAdaptiveExit, GCNResidualSubgraphAdaptiveExit
+
+        match exit_mode:
+            case ExitMode.NONE:
+                model = GCNResidualBackbone(backbone_config)
+            case ExitMode.NODE_ADAPTIVE:
+                model = GCNResidualNodeAdaptiveExit(backbone_config, exit_config)
+            case ExitMode.SUBGRAPH_ADAPTIVE:
+                model = GCNResidualSubgraphAdaptiveExit(backbone_config, exit_config)
+    else:
+        model = build_sas_model(backbone_config, exit_mode, exit_config)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
 
     score_func = mlp_score(
-        bc["hidden_channels"], bc["hidden_channels"], 1,
-        checkpoint["num_layers_predictor"], bc["dropout"],
+        bc["hidden_channels"],
+        bc["hidden_channels"],
+        1,
+        checkpoint["num_layers_predictor"],
+        bc["dropout"],
     )
     score_func.load_state_dict(checkpoint["score_func_state_dict"])
     score_func = score_func.to(device)
@@ -129,13 +144,17 @@ def compute_per_layer_auroc(
 
 @torch.no_grad()
 def evaluate_model(
-    checkpoint_path: Path, data: dict, device: torch.device,
+    checkpoint_path: Path,
+    data: dict,
+    device: torch.device,
     override_num_layers: int | None = None,
 ) -> EvalResult:
     init_seed(999)
 
     model, score_func, checkpoint = load_model_from_checkpoint(
-        checkpoint_path, device, override_num_layers,
+        checkpoint_path,
+        device,
+        override_num_layers,
     )
     model.eval()
     score_func.eval()
@@ -160,13 +179,22 @@ def evaluate_model(
     batch_size = 1024
     pos_train_pred, _ = test_edge(score_func, data["train_val"], h, batch_size)
     pos_valid_pred, neg_valid_pred = test_edge(
-        score_func, data["valid_pos"], h, batch_size, data["valid_neg"],
+        score_func,
+        data["valid_pos"],
+        h,
+        batch_size,
+        data["valid_neg"],
     )
     pos_test_pred, neg_test_pred = test_edge(
-        score_func, data["test_pos"], h, batch_size, data["test_neg"],
+        score_func,
+        data["test_pos"],
+        h,
+        batch_size,
+        data["test_neg"],
     )
 
     from ogb.linkproppred import Evaluator
+
     evaluator_mrr = Evaluator(name="ogbl-citation2")
 
     metrics = get_metric_score(
@@ -180,15 +208,24 @@ def evaluate_model(
 
     test_pos = data["test_pos"]
     exit_layers_cpu = exit_layers.cpu()
+
+    row, col, _ = adj.coo()
+    col_cpu = col.cpu()
+    hidden = bc["hidden_channels"]
+
+    active_edges_per_layer: list[int] = []
+    for layer in range(num_layers):
+        active_mask = exit_layers_cpu > layer
+        active_edges_per_layer.append(int(active_mask[col_cpu].sum().item()))
+
+    flops_per_layer = [an * hidden * hidden + ae * hidden for an, ae in zip(active_per_layer, active_edges_per_layer)]
+
     src_exit = exit_layers_cpu[test_pos[:, 0]]
     dst_exit = exit_layers_cpu[test_pos[:, 1]]
     resolution_layers = torch.maximum(src_exit, dst_exit)
 
     total_edges = resolution_layers.size(0)
-    edge_fracs = [
-        float((resolution_layers <= layer).sum().item()) / total_edges
-        for layer in range(num_layers + 1)
-    ]
+    edge_fracs = [float((resolution_layers <= layer).sum().item()) / total_edges for layer in range(num_layers + 1)]
 
     cum_cost: list[float] = []
     running = 0.0
@@ -199,7 +236,10 @@ def evaluate_model(
     exit_dist = [int((exit_layers == layer).sum().item()) for layer in range(num_layers + 1)]
 
     auroc_by_layer, count_by_layer = compute_per_layer_auroc(
-        pos_test_pred, neg_test_pred, resolution_layers, num_layers,
+        pos_test_pred,
+        neg_test_pred,
+        resolution_layers,
+        num_layers,
     )
 
     return EvalResult(
@@ -213,6 +253,8 @@ def evaluate_model(
         test_hits_at_100=metrics["Hits@100"][2],
         exit_distribution=exit_dist,
         active_nodes_per_layer=active_per_layer,
+        active_edges_per_layer=active_edges_per_layer,
+        flops_per_layer=flops_per_layer,
         edge_fraction_by_layer=edge_fracs,
         cumulative_compute_cost=cum_cost,
         total_compute_cost=float(sum(active_per_layer)),
@@ -222,7 +264,10 @@ def evaluate_model(
 
 
 def find_compute_balanced_L(
-    checkpoint_path: Path, data: dict, device: torch.device, target_cost: float,
+    checkpoint_path: Path,
+    data: dict,
+    device: torch.device,
+    target_cost: float,
 ) -> int:
     x = data["x"].to(device)
     adj = data["adj"].to(device)
@@ -256,45 +301,33 @@ def find_compute_balanced_L(
 
 def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    results: list[EvalResult] = []
-    compute_balanced_info: dict[str, dict] = {}
 
-    for dataset in ["cora", "citeseer"]:
+    l12_path = RESULTS_DIR / "l12_comparison.json"
+    if l12_path.exists():
+        with open(l12_path) as f:
+            all_l12 = json.load(f)
+    else:
+        all_l12 = {}
+
+    for dataset in ["cora", "citeseer", "pubmed"]:
         data = read_data(dataset, HEART_DATASET_DIR, "samples.npy")
 
         for exit_mode in ExitMode:
             ckpt = CHECKPOINTS_DIR / f"{dataset}_{exit_mode.value}_L12.pt"
+            if not ckpt.exists():
+                print(f"  Skipping {exit_mode.value} on {dataset} (no checkpoint)")
+                continue
             print(f"Evaluating {exit_mode.value} on {dataset}...")
             result = evaluate_model(ckpt, data, device)
-            results.append(result)
             print(f"  MRR={result.test_mrr:.4f}, cost={result.total_compute_cost:.0f}")
 
-        node_result = next(r for r in results if r.dataset == dataset and r.model_type == "node_adaptive")
-        sub_ckpt = CHECKPOINTS_DIR / f"{dataset}_subgraph_adaptive_L12.pt"
-        balanced_l = find_compute_balanced_L(sub_ckpt, data, device, node_result.total_compute_cost)
-        print(f"Compute-balanced L for subgraph_adaptive on {dataset}: {balanced_l}")
-
-        if balanced_l != 12:
-            balanced_result = evaluate_model(sub_ckpt, data, device, override_num_layers=balanced_l)
-            results.append(balanced_result)
-            print(f"  Balanced MRR={balanced_result.test_mrr:.4f}, cost={balanced_result.total_compute_cost:.0f}")
-
-        compute_balanced_info[dataset] = {
-            "node_adaptive_L": 12,
-            "node_adaptive_cost": node_result.total_compute_cost,
-            "subgraph_adaptive_balanced_L": balanced_l,
-        }
+            all_l12.setdefault(dataset, {})[exit_mode.value] = asdict(result)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    for result in results:
-        filename = f"{result.dataset}_{result.model_type}_L{result.num_layers}.json"
-        with open(RESULTS_DIR / filename, "w") as f:
-            json.dump(asdict(result), f, indent=2)
+    with open(l12_path, "w") as f:
+        json.dump(all_l12, f, indent=2)
 
-    with open(RESULTS_DIR / "compute_balanced.json", "w") as f:
-        json.dump(compute_balanced_info, f, indent=2)
-
-    print(f"\nAll results saved to {RESULTS_DIR}")
+    print(f"\nResults saved to {l12_path}")
 
 
 if __name__ == "__main__":

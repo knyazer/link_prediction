@@ -1,13 +1,13 @@
-import sys
 from pathlib import Path
 
-OURS_DIR = Path(__file__).resolve().parent
-HEART_BENCHMARKING_DIR = OURS_DIR.parent / "HeaRT" / "benchmarking"
-sys.path.insert(0, str(OURS_DIR))
-sys.path.insert(0, str(HEART_BENCHMARKING_DIR))
+from shared import (
+    ExitMode,
+    HEART_DATASET_DIR,
+    HEART_BENCHMARKING_DIR,
+    build_sas_model,
+)
 
 import argparse
-from enum import Enum
 
 import numpy as np
 import torch
@@ -15,18 +15,9 @@ from torch.utils.data import DataLoader
 from torch_sparse import SparseTensor
 
 from evalutors import evaluate_mrr
+from model import BackboneConfig, ExitConfig
 from scoring import mlp_score
 from utils import Logger, get_logger, init_seed
-
-from model import BackboneConfig, ExitConfig, NodeAdaptiveExit, SubgraphAdaptiveExit, WeightSharedSAS
-
-
-class ExitMode(Enum):
-    NONE = "none"
-    NODE_ADAPTIVE = "node_adaptive"
-    SUBGRAPH_ADAPTIVE = "subgraph_adaptive"
-
-HEART_DATASET_DIR = HEART_BENCHMARKING_DIR.parent / "dataset"
 
 log_print = get_logger("ours_testrun", "log", str(HEART_BENCHMARKING_DIR / "config"))
 
@@ -220,7 +211,9 @@ def test(
     neg_valid_pred = neg_valid_pred.squeeze(-1)
     neg_test_pred = neg_test_pred.squeeze(-1)
 
-    return get_metric_score(evaluator_mrr, pos_train_pred, pos_valid_pred, neg_valid_pred, pos_test_pred, neg_test_pred)
+    return get_metric_score(
+        evaluator_mrr, pos_train_pred, pos_valid_pred, neg_valid_pred, pos_test_pred, neg_test_pred
+    )
 
 
 def main() -> None:
@@ -244,8 +237,11 @@ def main() -> None:
     parser.add_argument("--filename", type=str, default="samples.npy")
     parser.add_argument("--eval_mrr_data_name", type=str, default="ogbl-citation2")
     parser.add_argument(
-        "--exit_mode", type=lambda s: ExitMode(s), default=ExitMode.NONE,
-        choices=list(ExitMode), metavar="{none,node_adaptive,subgraph_adaptive}",
+        "--exit_mode",
+        type=lambda s: ExitMode(s),
+        default=ExitMode.NONE,
+        choices=list(ExitMode),
+        metavar="{none,node_adaptive,subgraph_adaptive}",
     )
     parser.add_argument("--tau0", type=float, default=1.0)
     parser.add_argument("--confidence_hidden_dim", type=int, default=64)
@@ -280,15 +276,14 @@ def main() -> None:
             num_layers=args.num_layers,
             dropout=args.dropout,
         )
-        match args.exit_mode:
-            case ExitMode.NONE:
-                model = WeightSharedSAS(backbone_config).to(device)
-            case ExitMode.NODE_ADAPTIVE:
-                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim, hard_gumbel=args.hard_gumbel)
-                model = NodeAdaptiveExit(backbone_config, exit_config).to(device)
-            case ExitMode.SUBGRAPH_ADAPTIVE:
-                exit_config = ExitConfig(tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim, hard_gumbel=args.hard_gumbel)
-                model = SubgraphAdaptiveExit(backbone_config, exit_config).to(device)
+        exit_config = (
+            ExitConfig(
+                tau0=args.tau0, confidence_hidden_dim=args.confidence_hidden_dim, hard_gumbel=args.hard_gumbel
+            )
+            if args.exit_mode != ExitMode.NONE
+            else None
+        )
+        model = build_sas_model(backbone_config, args.exit_mode, exit_config).to(device)
 
         score_func = mlp_score(
             args.hidden_channels,
